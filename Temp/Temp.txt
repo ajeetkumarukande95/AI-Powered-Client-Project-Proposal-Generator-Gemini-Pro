@@ -1,0 +1,186 @@
+with tab_summary:
+    st.subheader("Generate Document Summaries")
+    st.markdown(
+        "Upload a document directly for summarisation, or select one "
+        "already in the knowledge base."
+    )
+
+    summary_source = st.radio(
+        "Document source",
+        options  = ["Upload a document", "Select from knowledge base"],
+        index    = 0,
+        key      = "sum_source_radio",
+        horizontal = True,
+    )
+
+    col_sel, col_mode = st.columns([3, 1])
+
+    with col_mode:
+        mode_label = st.selectbox(
+            "Summary length",
+            options = list(SUMMARY_MODES.keys()),
+            index   = 1,
+            key     = "sum_mode_select",
+        )
+    summary_mode = SUMMARY_MODES[mode_label]
+
+    # ── Source: direct upload ─────────────────────────────
+    if summary_source == "Upload a document":
+        with col_sel:
+            uploaded_sum_file = st.file_uploader(
+                "Upload document (PDF, DOCX, PPTX)",
+                type = ["pdf", "docx", "pptx"],
+                key  = "sum_file_uploader",
+            )
+
+        ready         = uploaded_sum_file is not None
+        doc_label     = uploaded_sum_file.name if uploaded_sum_file else ""
+        use_upload    = True
+
+    # ── Source: knowledge base ────────────────────────────
+    else:
+        docs = get_persisted_documents()
+        if not docs:
+            st.info(
+                "No documents found in the knowledge base. "
+                "Switch to 'Upload a document' or use the ingestion pipeline."
+            )
+            ready = False
+        else:
+            with col_sel:
+                selected_doc = st.selectbox(
+                    "Select document to summarise",
+                    options = [d["filename"] for d in docs],
+                    key     = "sum_doc_select",
+                )
+            ready      = True
+            doc_label  = selected_doc
+            use_upload = False
+
+    if ready and st.button(
+        "📋 Generate Summary", type="primary", key="btn_generate_summary"
+    ):
+        t0 = datetime.now()
+
+        with experiment_error_handler():
+
+            # ── Extract content ───────────────────────────
+            if use_upload:
+                # Read uploaded file bytes and extract text
+                file_bytes = uploaded_sum_file.read()
+                file_ext   = uploaded_sum_file.name.rsplit(".", 1)[-1].lower()
+
+                with st.spinner("Extracting document text…"):
+                    try:
+                        if file_ext == "pdf":
+                            import pypdf
+                            reader  = pypdf.PdfReader(io.BytesIO(file_bytes))
+                            content = "\n\n".join(
+                                p.extract_text() or "" for p in reader.pages
+                            )
+                        elif file_ext == "docx":
+                            import docx as _docx
+                            doc_obj = _docx.Document(io.BytesIO(file_bytes))
+                            content = "\n\n".join(
+                                p.text for p in doc_obj.paragraphs
+                                if p.text.strip()
+                            )
+                        elif file_ext == "pptx":
+                            from pptx import Presentation
+                            prs     = Presentation(io.BytesIO(file_bytes))
+                            parts   = []
+                            for slide in prs.slides:
+                                for shape in slide.shapes:
+                                    if hasattr(shape, "text") and shape.text.strip():
+                                        parts.append(shape.text.strip())
+                            content = "\n\n".join(parts)
+                        else:
+                            content = ""
+                    except Exception as e:
+                        st.error(f"Could not extract text: {e}")
+                        content = ""
+
+                if not content.strip():
+                    st.warning("No text could be extracted from this document.")
+                    st.stop()
+
+            else:
+                # Pull from pgvector
+                vs = get_vector_store()
+                with st.spinner(f"Retrieving content for '{doc_label}'…"):
+                    all_results = vs.similarity_search(doc_label, k=40)
+                    doc_chunks  = [
+                        r for r in all_results
+                        if r.get("metadata", {}).get("source") == doc_label
+                    ]
+
+                if not doc_chunks:
+                    st.warning(
+                        f"No content found for '{doc_label}'. "
+                        "The document may not be correctly indexed."
+                    )
+                    st.stop()
+
+                content = "\n\n".join(c["content"] for c in doc_chunks[:50])
+
+            # ── Truncate if needed ────────────────────────
+            max_chars = 60_000
+            if len(content) > max_chars:
+                st.warning(
+                    f"Document is large ({len(content):,} chars). "
+                    f"Summary based on first {max_chars:,} characters."
+                )
+                content = content[:max_chars]
+
+            # ── Generate ──────────────────────────────────
+            prompt = build_summary_prompt(doc_label, content, summary_mode)
+
+            with st.spinner("Generating summary…"):
+                response = invoke_llm_with_retry(
+                    lambda: initialize_llm(),
+                    [HumanMessage(content=prompt)],
+                )
+                summary = (
+                    to_text(response.content)
+                    if hasattr(response, "content")
+                    else str(response)
+                )
+
+            elapsed = (datetime.now() - t0).total_seconds()
+            st.success(f"Summary generated in {elapsed:.1f}s")
+            st.divider()
+
+            st.subheader(f"Executive Summary — {doc_label}")
+            st.caption(
+                f"Source: {'Uploaded file' if use_upload else 'Knowledge base'}  |  "
+                f"Mode: {mode_label}  |  "
+                f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+            st.markdown(summary)
+
+            st.download_button(
+                label     = "⬇️ Download Summary (Markdown)",
+                data      = (
+                    f"# Executive Summary — {doc_label}\n\n"
+                    f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n\n"
+                    f"{summary}"
+                ),
+                file_name = f"summary_{doc_label.rsplit('.', 1)[0]}.md",
+                mime      = "text/markdown",
+                key       = "sum_download",
+            )
+
+            st.divider()
+            render_feedback_widget(
+                msg_idx = hash(doc_label + summary_mode) % 10_000,
+                prefix  = "summary",
+            )
+
+            log_llm_run(
+                f"[SUMMARY] {doc_label}",
+                summary,
+                [{"source": doc_label}],
+                "summary",
+                elapsed,
+            )
+            st.session_state.et_ra_latest_summary_output = summary
